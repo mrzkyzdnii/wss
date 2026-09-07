@@ -1,99 +1,146 @@
-import { WebSocketServer } from 'ws'
+// server.js — WebSocket server buat Growtopia Online (dengan logging debug)
+// npm install ws
+// node server.js
 
-const port = process.env.PORT || 8080
-const wss = new WebSocketServer({ port })
+import { WebSocketServer } from "ws"
+import http from "node:http"
 
-// Simpan data tiap room: { clients: Set, players: Map, worldState: Map }
+const PORT = process.env.PORT || 3000
+
 const rooms = new Map()
 
-function getRoom(roomName) {
-  if (!rooms.has(roomName)) {
-    rooms.set(roomName, {
-      clients: new Set(),
-      players: new Map(),
-      worldBlocks: new Map() // nyimpen blok yg diubah: "x,y" => tileId
-    })
+function getRoom(name) {
+  if (!rooms.has(name)) {
+    rooms.set(name, { players: new Map(), blocks: new Map() })
+    console.log(`[ROOM] dibuat: "${name}"`)
   }
-  return rooms.get(roomName)
+  return rooms.get(name)
 }
 
-wss.on('connection', (ws) => {
-  let currentRoom = null
-  let playerId = null
+function broadcast(roomName, data, excludeId) {
+  const room = rooms.get(roomName)
+  if (!room) {
+    console.log(`[BROADCAST] room "${roomName}" tidak ditemukan!`)
+    return
+  }
+  const payload = JSON.stringify(data)
+  let sentTo = 0
+  for (const [id, p] of room.players) {
+    if (id === excludeId) continue
+    if (p.ws.readyState === p.ws.OPEN) {
+      p.ws.send(payload)
+      sentTo++
+    }
+  }
+  console.log(`[BROADCAST] room "${roomName}" type=${data.type} dari=${excludeId} -> terkirim ke ${sentTo} orang (total di room: ${room.players.size})`)
+}
 
-  ws.on('message', (raw) => {
+const server = http.createServer((req, res) => {
+  // endpoint biar bisa dicek dari browser: https://domain-kamu/status
+  if (req.url === "/status") {
+    const info = {}
+    for (const [name, room] of rooms) {
+      info[name] = [...room.players.values()].map(p => ({ id: p.id, name: p.name }))
+    }
+    res.writeHead(200, { "Content-Type": "application/json" })
+    res.end(JSON.stringify(info, null, 2))
+    return
+  }
+  res.writeHead(200, { "Content-Type": "text/plain" })
+  res.end("WS server hidup. Endpoint: /ws (websocket), /status (lihat room aktif)")
+})
+
+const wss = new WebSocketServer({ server, path: "/ws" })
+
+wss.on("connection", (ws, req) => {
+  console.log(`[CONNECT] koneksi baru dari ${req.socket.remoteAddress}`)
+  let myRoom = null
+  let myId = null
+
+  ws.on("message", (raw) => {
+    let d
     try {
-      const data = JSON.parse(raw.toString())
-      if (!data.room) return
+      d = JSON.parse(raw.toString())
+    } catch {
+      console.log("[ERROR] pesan bukan JSON valid:", raw.toString().slice(0, 100))
+      return
+    }
+    if (!d.room || !d.id) {
+      console.log("[SKIP] pesan tanpa room/id:", d.type)
+      return
+    }
 
-      const room = getRoom(data.room)
+    const room = getRoom(d.room)
 
-      // 1. Pemain Baru Join
-      if (data.type === 'join') {
-        // Cek limit maksimal 10 pemain
-        if (room.clients.size >= 10 && !room.clients.has(ws)) {
-          ws.send(JSON.stringify({ type: 'error', message: 'Room penuh! (Max 10 pemain)' }))
-          ws.close()
-          return
-        }
+    if (d.type === "join") {
+      myRoom = d.room
+      myId = d.id
+      console.log(`[JOIN] "${d.name}" (${d.id}) masuk room "${d.room}" — total sebelum: ${room.players.size}`)
 
-        currentRoom = data.room
-        playerId = data.id
-        room.clients.add(ws)
-        room.players.set(playerId, data)
+      room.players.set(d.id, {
+        id: d.id, name: d.name, color: d.color, x: d.x, y: d.y, dir: d.dir || 1, ws
+      })
 
-        // Kirim daftar blok yang udah pernah diubah ke pemain baru ini
-        const modifiedBlocks = Array.from(room.worldBlocks.entries()).map(([pos, tile]) => {
-          const [x, y] = pos.split(',').map(Number)
-          return { x, y, tile }
-        })
-
-        ws.send(JSON.stringify({
-          type: 'init_world',
-          blocks: modifiedBlocks,
-          players: Array.from(room.players.values())
-        }))
+      const blocksArr = []
+      for (const [key, tile] of room.blocks) {
+        const [x, y] = key.split(",").map(Number)
+        blocksArr.push({ x, y, tile })
       }
-
-      // 2. Simpan perubahan blok (Hancur / Pasang blok)
-      if (data.type === 'block') {
-        room.worldBlocks.set(`${data.x},${data.y}`, data.tile)
+      const playersArr = []
+      for (const [pid, p] of room.players) {
+        if (pid === d.id) continue
+        playersArr.push({ id: p.id, name: p.name, color: p.color, x: p.x, y: p.y, dir: p.dir, type: "join" })
       }
+      console.log(`[INIT_WORLD] kirim ke "${d.name}": ${playersArr.length} pemain lain, ${blocksArr.length} block`)
+      ws.send(JSON.stringify({ type: "init_world", blocks: blocksArr, players: playersArr }))
 
-      // 3. Update posisi player
-      if (data.type === 'move' && playerId) {
-        room.players.set(playerId, data)
-      }
+      broadcast(d.room, { type: "join", id: d.id, name: d.name, color: d.color, x: d.x, y: d.y }, d.id)
+      return
+    }
 
-      // 4. Broadcast ke pemain lain di room yang sama
-      for (const client of room.clients) {
-        if (client !== ws && client.readyState === ws.OPEN) {
-          client.send(JSON.stringify(data))
-        }
+    if (d.type === "move") {
+      const p = room.players.get(d.id)
+      if (!p) {
+        // player kirim move tapi belum pernah join di room ini -> daftarkan otomatis
+        console.log(`[WARN] move dari id belum join: ${d.id}, auto-registering`)
+        room.players.set(d.id, { id: d.id, name: d.name, color: d.color, x: d.x, y: d.y, dir: d.dir, ws })
+        myRoom = d.room
+        myId = d.id
+      } else {
+        p.x = d.x; p.y = d.y; p.dir = d.dir
       }
-    } catch (e) {}
+      broadcast(d.room, { type: "move", id: d.id, name: d.name, color: d.color, x: d.x, y: d.y, dir: d.dir, chat: d.chat, chatTimer: d.chatTimer }, d.id)
+      return
+    }
+
+    if (d.type === "chat") {
+      broadcast(d.room, { type: "chat", id: d.id, name: d.name, text: d.text }, d.id)
+      return
+    }
+
+    if (d.type === "block") {
+      room.blocks.set(`${d.x},${d.y}`, d.tile)
+      broadcast(d.room, { type: "block", x: d.x, y: d.y, tile: d.tile }, d.id)
+      return
+    }
   })
 
-  // Pemain keluar / tutup game
-  ws.on('close', () => {
-    if (currentRoom && rooms.has(currentRoom)) {
-      const room = rooms.get(currentRoom)
-      room.clients.delete(ws)
-      if (playerId) {
-        room.players.delete(playerId)
-        // Kabari pemain lain kalau ada yg keluar biar karakternya hilang
-        for (const client of room.clients) {
-          if (client.readyState === ws.OPEN) {
-            client.send(JSON.stringify({ type: 'leave', id: playerId }))
-          }
+  ws.on("close", () => {
+    console.log(`[DISCONNECT] id=${myId} room=${myRoom}`)
+    if (myRoom && myId) {
+      const room = rooms.get(myRoom)
+      if (room) {
+        room.players.delete(myId)
+        broadcast(myRoom, { type: "leave", id: myId }, null)
+        if (room.players.size === 0) {
+          rooms.delete(myRoom)
+          console.log(`[ROOM] "${myRoom}" dihapus (kosong)`)
         }
-      }
-      // Hapus room kalau udah kosong biar hemat RAM
-      if (room.clients.size === 0) {
-        rooms.delete(currentRoom)
       }
     }
   })
 })
 
-console.log(`✅ WebSocket Server Growtopia Online jalan di port ${port}`)
+server.listen(PORT, () => {
+  console.log(`WS server jalan di port ${PORT}, path /ws`)
+})
