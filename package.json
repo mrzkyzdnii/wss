@@ -1,14 +1,14 @@
 {
-  "name": "8bit-realtime-game",
+  "name": "gt-mini-game",
   "version": "1.0.0",
-  "description": "8-bit multiplayer game with realtime chat via WebSocket",
+  "description": "8-bit mining/building platformer with realtime chat via WebSocket",
   "main": "server.js",
   "type": "module",
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js"
   },
-  "keywords": ["websocket", "game", "8bit", "realtime", "chat", "whatsapp"],
+  "keywords": ["websocket", "game", "8bit", "mining", "building", "realtime", "chat", "whatsapp"],
   "author": "kt",
   "license": "MIT",
   "dependencies": {
